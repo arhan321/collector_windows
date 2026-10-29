@@ -1,3 +1,5 @@
+# Running Collector Data For Robot YASKAWA SP210(manipulator) YRC1000(controller) / DX100(controller) ES200D(manipulator)
+
 ## Cara running project nya : 
 
 ### sebelum melakukan perintah apapun di terminal wajib ketik : 
