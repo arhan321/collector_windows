@@ -10,9 +10,17 @@ cmd
 ```
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 ```
-### jalankan CMAKE compile
+### jalankan Konfigurasi CMake
 ```
 cmake -S . -B build-win -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DRMS_ENABLE_YMCONNECT=ON -DCMAKE_TOOLCHAIN_FILE=D:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_APPLOCAL_DEPS=ON
+```
+### Compile project
+```
+cmake --build build-win 
+```
+### setelah itu harus kasih chcp 65001 supaya terkonvert ke UTF-8
+```
+chcp 65001
 ```
 ### selanjutnya running hasil compile nya 
 ```
