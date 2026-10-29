@@ -1,0 +1,466 @@
+// RMS Yaskawa Collector v2: read-only YMConnect, local Laravel v1 API.
+// Mock mode is a full offline-data pipeline. REAL extensions require matching YMConnect.h.
+// Never controls servos, movement, jobs, IO writes, or safety functions.
+#include <curl/curl.h>
+#include <iconv.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
+#if defined(RMS_WITH_YMCONNECT) && RMS_WITH_YMCONNECT
+#include "YMConnect.h"
+#endif
+
+namespace fs=std::filesystem;
+using Clock=std::chrono::steady_clock;
+static std::atomic<bool> running{true};
+static std::mutex logMutex;
+static const std::array<std::string,6> AXES{{"S","L","U","R","B","T"}};
+static void onSignal(int){running=false;}
+static void log(const std::string& s){std::lock_guard<std::mutex> lock(logMutex);std::cout<<s<<std::endl;}
+static std::string trim(std::string s){auto a=s.find_first_not_of(" \t\r\n");if(a==std::string::npos)return {};auto b=s.find_last_not_of(" \t\r\n");return s.substr(a,b-a+1);}
+// YMConnect can return CP932 and NUL-padded text; HTTP JSON and PostgreSQL require UTF-8.
+static std::optional<std::string> utf8From(const std::string& text,const char* encoding){
+ iconv_t converter=iconv_open("UTF-8",encoding);
+ if(converter==reinterpret_cast<iconv_t>(-1))
+  throw std::runtime_error(std::string("Cannot open text converter: ")+encoding);
+ struct CloseConverter{iconv_t value;~CloseConverter(){iconv_close(value);}} close{converter};
+ std::string input=text,output(text.size()*4+16,'\0');
+ char* source=input.data();size_t sourceLeft=input.size();
+ char* destination=output.data();size_t destinationLeft=output.size();
+ if(iconv(converter,&source,&sourceLeft,&destination,&destinationLeft)==static_cast<size_t>(-1))
+  return std::nullopt;
+ output.resize(output.size()-destinationLeft);return output;
+}
+static std::string jsonText(std::string text){
+ text.erase(std::remove(text.begin(),text.end(),'\0'),text.end());
+ if(auto utf8=utf8From(text,"UTF-8"))return *utf8;
+ if(auto utf8=utf8From(text,"CP932"))return *utf8;
+ throw std::runtime_error("SDK text is neither valid UTF-8 nor CP932; cannot serialize JSON");
+}
+static std::string quote(const std::string&s){const auto text=jsonText(s);std::ostringstream o;o<<'"';for(unsigned char c:text){switch(c){case '"':o<<"\\\"";break;case '\\':o<<"\\\\";break;case '\n':o<<"\\n";break;case '\r':o<<"\\r";break;case '\t':o<<"\\t";break;default:if(c<0x20){o<<"\\u"<<std::hex<<std::setw(4)<<std::setfill('0')<<int(c)<<std::dec<<std::setfill(' ');}else o<<char(c);}}o<<'"';return o.str();}
+static std::string number(double v){if(!std::isfinite(v))throw std::runtime_error("Non-finite numeric SDK data");std::ostringstream o;o<<std::setprecision(15)<<v;return o.str();}
+class Json{
+ std::ostringstream out;bool first=true;
+ public:
+ void raw(const std::string&k,const std::string&v){if(!first)out<<',';first=false;out<<quote(k)<<':'<<v;}
+ void str(const std::string&k,const std::string&v){raw(k,quote(v));}
+ void flag(const std::string&k,bool b){raw(k,b?"true":"false");}
+ void num(const std::string&k,long long v){raw(k,std::to_string(v));}
+ void num(const std::string&k,int v){raw(k,std::to_string(v));}
+ void num(const std::string&k,double v){raw(k,number(v));}
+ void null(const std::string&k){raw(k,"null");}
+ std::string dump()const{return "{"+out.str()+"}";}
+};
+static std::string timestamp(){auto n=std::chrono::system_clock::now();auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(n.time_since_epoch())%1000;auto tt=std::chrono::system_clock::to_time_t(n);std::tm tm{};
+#if defined(_WIN32)
+ gmtime_s(&tm,&tt);
+#else
+ gmtime_r(&tt,&tm);
+#endif
+ std::ostringstream o;o<<std::put_time(&tm,"%Y-%m-%dT%H:%M:%S")<<'.'<<std::setfill('0')<<std::setw(3)<<ms.count()<<'Z';return o.str();}
+static std::string uuid(){std::random_device rd;std::mt19937_64 g((uint64_t(rd())<<32)^rd());std::array<unsigned char,16> x{};for(auto&v:x)v=static_cast<unsigned char>(g()&255);x[6]=(x[6]&15)|64;x[8]=(x[8]&63)|128;std::ostringstream o;for(int i=0;i<16;i++){if(i==4||i==6||i==8||i==10)o<<'-';o<<std::hex<<std::setfill('0')<<std::setw(2)<<int(x[i]);}return o.str();}
+static std::string axesJson(const std::array<double,6>& a){Json j;for(int i=0;i<6;i++)j.num(AXES[i],a[i]);return j.dump();}
+static int integer(const std::string&k,const std::string&s,int lo,int hi){size_t p=0;long n=std::stol(s,&p);if(p!=s.size()||n<lo||n>hi)throw std::runtime_error("Invalid "+k+": "+s);return int(n);}
+static std::vector<std::string> split(const std::string&s,char delimiter){std::vector<std::string>v;std::stringstream in(s);std::string a;while(std::getline(in,a,delimiter))v.push_back(trim(a));return v;}
+struct Device{int id=0;std::string ip;std::string group="R1";std::vector<int> io;};
+struct Config{
+ std::string base="http://127.0.0.1:8080";std::string token="./collector.token";std::string spool="./spool";
+ int telemetryMs=5000,operatingS=60,alarmS=30,extrasS=10,timeoutS=5,retryLimit=20000;
+ std::vector<Device> devices;
+};
+static Config configFrom(const std::string&path){std::ifstream f(path);if(!f)throw std::runtime_error("Missing config: "+path);Config c;std::string l;int line=0;while(std::getline(f,l)){++line;l=trim(l);if(l.empty()||l[0]=='#')continue;auto p=l.find('=');if(p==std::string::npos)throw std::runtime_error("Expected key=value at "+std::to_string(line));auto k=trim(l.substr(0,p)),v=trim(l.substr(p+1));
+ if(k=="api_base")c.base=v;else if(k=="token_file")c.token=v;else if(k=="spool_dir")c.spool=v;
+ else if(k=="telemetry_ms")c.telemetryMs=integer(k,v,1000,3600000);
+ else if(k=="operating_every_s")c.operatingS=integer(k,v,5,86400);
+ else if(k=="alarms_every_s")c.alarmS=integer(k,v,5,86400);
+ else if(k=="extras_every_s")c.extrasS=integer(k,v,5,86400);
+ else if(k=="http_timeout_s")c.timeoutS=integer(k,v,1,120);
+ else if(k=="spool_max")c.retryLimit=integer(k,v,100,200000);
+ else if(k=="robot") { // robot=DB_ID,CONTROLLER_IP,R1,IO_ADDRESS;IO_ADDRESS
+  auto a=split(v,',');if(a.size()<2||a.size()>4)throw std::runtime_error("robot config requires id,ip[,group[,io;io]]");
+  Device d;d.id=integer("robot_id",a[0],1,1000000);d.ip=a[1];if(a.size()>=3)d.group=a[2];
+  if(d.ip.empty())throw std::runtime_error("Robot IP is empty");
+  if(d.group!="R1")throw std::runtime_error("This version is validated only for group R1; configure a separate validated adapter for "+d.group);
+  if(a.size()==4&&!a[3].empty())for(auto &x:split(a[3],';'))d.io.push_back(integer("IO address",x,1,99999));
+  if(d.io.size()>24)throw std::runtime_error("Maximum 24 IO byte addresses per robot");
+  for(auto &old:c.devices)if(old.id==d.id||old.ip==d.ip)throw std::runtime_error("Duplicate robot ID/IP");
+  c.devices.push_back(std::move(d));
+ }else throw std::runtime_error("Unknown config key: "+k);
+ }
+ if(c.base.rfind("http://",0)!=0||c.base.find_first_of("?#")!=std::string::npos)throw std::runtime_error("Use a trusted local/LAN http:// API base URL, no query string");
+ while(c.base.size()>7&&c.base.back()=='/')c.base.pop_back();
+ if(c.devices.empty())throw std::runtime_error("Add at least one robot= entry");
+ if(c.devices.size()>8)throw std::runtime_error("Pilot max 8 robots; validate controller load before scaling");
+ return c;}
+static std::string readToken(const fs::path&path){std::ifstream f(path);std::string token;if(!f||!std::getline(f,token))throw std::runtime_error("Missing collector token file: "+path.string());token=trim(token);if(token.empty()||token.find_first_of(" \r\n\t")!=std::string::npos)throw std::runtime_error("Bad token file");return token;}
+static size_t sink(char*p,size_t n,size_t m,void*data){auto&s=*static_cast<std::string*>(data);size_t bytes=n*m;if(s.size()<4096)s.append(p,std::min(bytes,4096-s.size()));return bytes;}
+struct HttpResult{CURLcode error=CURLE_OK;long status=0;std::string body;bool ok()const{return error==CURLE_OK&&status>=200&&status<300;}bool fatal()const{return error==CURLE_OK&&status>=400&&status<500&&status!=408&&status!=425&&status!=429;}std::string summary()const{return error==CURLE_OK?std::to_string(status):curl_easy_strerror(error);}};
+class Http{
+ const Config& c;std::string bearer;
+ public:Http(const Config& cfg,std::string token):c(cfg),bearer(std::move(token)){}
+ HttpResult run(const std::string&endpoint,const std::string&payload={},bool isPost=true){CURL* h=curl_easy_init();if(!h)throw std::runtime_error("curl_easy_init failed");HttpResult r;std::string url=c.base+endpoint;curl_slist*headers=nullptr;
+  headers=curl_slist_append(headers,"Accept: application/json");if(isPost){headers=curl_slist_append(headers,"Content-Type: application/json");auto auth="Authorization: Bearer "+bearer;headers=curl_slist_append(headers,auth.c_str());curl_easy_setopt(h,CURLOPT_POST,1L);curl_easy_setopt(h,CURLOPT_POSTFIELDS,payload.c_str());curl_easy_setopt(h,CURLOPT_POSTFIELDSIZE_LARGE,curl_off_t(payload.size()));}
+  curl_easy_setopt(h,CURLOPT_URL,url.c_str());curl_easy_setopt(h,CURLOPT_HTTPHEADER,headers);curl_easy_setopt(h,CURLOPT_CONNECTTIMEOUT,3L);curl_easy_setopt(h,CURLOPT_TIMEOUT,long(c.timeoutS));curl_easy_setopt(h,CURLOPT_FOLLOWLOCATION,0L);curl_easy_setopt(h,CURLOPT_WRITEFUNCTION,sink);curl_easy_setopt(h,CURLOPT_WRITEDATA,&r.body);r.error=curl_easy_perform(h);if(r.error==CURLE_OK)curl_easy_getinfo(h,CURLINFO_RESPONSE_CODE,&r.status);curl_slist_free_all(headers);curl_easy_cleanup(h);return r;
+ }
+};
+static bool endpointAllowed(const std::string&ep){return ep=="/api/v1/collector/telemetry"||ep=="/api/v1/collector/operating-times"||ep=="/api/v1/collector/alarms/snapshots"||ep=="/api/v1/collector/connections";}
+// Each robot runs with its own dispatcher/spool directory so threads never race on queue filenames.
+class Dispatcher{
+ Config c;Device device;bool dry;std::unique_ptr<Http> http;fs::path dir;uint64_t counter=0;
+ void spool(const std::string&ep,const std::string&json,bool rejected=false){
+  fs::create_directories(dir);
+  if(!rejected){size_t cnt=0;for(auto&it:fs::directory_iterator(dir))if(it.is_regular_file()&&it.path().extension()==".queue")cnt++;if(cnt>=size_t(c.retryLimit))throw std::runtime_error("Queue full; collector stops instead of silently dropping data");}
+  const fs::path targetDir=rejected?dir/"rejected":dir;fs::create_directories(targetDir);
+  auto t=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();fs::path name=targetDir/(std::to_string(t)+"_"+std::to_string(counter++)+".queue");fs::path tmp=name.string()+".tmp";{std::ofstream out(tmp,std::ios::binary|std::ios::trunc);if(!out)throw std::runtime_error("Cannot write spool");out<<ep<<'\n'<<json<<'\n';out.flush();if(!out)throw std::runtime_error("Spool write failed");}fs::rename(tmp,name);
+ }
+ public:Dispatcher(const Config&config,const Device&d,bool isDry,const std::string&token):c(config),device(d),dry(isDry),dir(fs::path(c.spool)/std::to_string(d.id)){if(!dry){fs::create_directories(dir);http=std::make_unique<Http>(c,token);}}
+ void post(const std::string&ep,const std::string&json){
+  if(!endpointAllowed(ep))throw std::runtime_error("Unsafe endpoint");
+  if(dry){log("[DRY id="+std::to_string(device.id)+"] POST "+ep+" "+json);return;}
+  auto r=http->run(ep,json);
+  if(r.ok()){log("[API "+std::to_string(device.id)+"] "+ep+" => "+r.summary());return;}
+  if(r.fatal()){
+   // Retrying a permanent 4xx cannot succeed. Preserve the payload outside the retry queue.
+   spool(ep,json,true);
+   log("[REJECT "+std::to_string(device.id)+"] "+ep+" HTTP "+r.summary()+" saved to "+(dir/"rejected").string()+" "+r.body.substr(0,800));
+   throw std::runtime_error("Laravel rejected POST (auth/permission/validation); inspect the rejected spool.");
+  }
+  spool(ep,json);
+  log("[SPOOL "+std::to_string(device.id)+"] "+ep+" failed "+r.summary()+" "+r.body.substr(0,160));
+ }
+ void flush(){
+  if(dry)return;
+  std::vector<fs::path>files;
+  for(auto&p:fs::directory_iterator(dir))if(p.is_regular_file()&&p.path().extension()==".queue")files.push_back(p.path());
+  std::sort(files.begin(),files.end());size_t n=0;
+  for(auto&path:files){
+   if(n++>=10)break;
+   std::ifstream in(path);std::string ep,json;
+   if(!std::getline(in,ep)||!std::getline(in,json)||!endpointAllowed(ep))
+    throw std::runtime_error("Invalid queue file: "+path.string());
+   auto r=http->run(ep,json);
+   if(r.ok()){fs::remove(path);log("[REPLAY "+std::to_string(device.id)+"] HTTP "+r.summary());continue;}
+   if(r.error==CURLE_OK&&r.status==422){
+    // A pre-fix JSON payload remains invalid on every replay. Preserve it for inspection.
+    const fs::path rejected=dir/"rejected";fs::create_directories(rejected);
+    const fs::path target=rejected/path.filename();
+    if(fs::exists(target))throw std::runtime_error("Rejected spool filename already exists: "+target.string());
+    fs::rename(path,target);
+    log("[QUARANTINE "+std::to_string(device.id)+"] HTTP 422 "+target.string()+" "+r.body.substr(0,800));
+    continue;
+   }
+   if(r.fatal())throw std::runtime_error("Queue replay blocked by permanent API rejection: HTTP "+r.summary()+" "+r.body.substr(0,800));
+   break;
+  }
+ }
+};
+struct Reading{bool ok=false;int code=-1;std::string error="unavailable",raw;};
+struct OperatingReading{std::string type;Reading result;std::optional<int64_t> seconds;};
+struct RobotSample{
+ Reading pos,torque,operating,alarm,state,job,io,alarmHistory;
+ std::array<double,6> pulses{},torques{};
+ std::optional<int64_t> operatingSeconds;
+ std::vector<OperatingReading> operatingReadings;
+ std::optional<int> activeAlarms;
+ std::optional<std::string> jobName;
+ std::string stateJson="null",jobJson="null",ioJson="null",alarmHistoryJson="null",activeAlarmsJson="[]",systemInfoJson="null";
+};
+// Stream-based SDK diagnostics are not guaranteed to be machine-readable structured fields.
+template<typename T,typename=void>struct Streamable:std::false_type{};
+template<typename T>struct Streamable<T,std::void_t<decltype(std::declval<std::ostream&>()<<std::declval<const T&>())>>:std::true_type{};
+template<typename T>static std::string streamIfPossible(const T&x){if constexpr(Streamable<T>::value){std::ostringstream out;out<<x;return out.str();}else return "type not streamable in installed SDK";}
+class Reader{public:virtual ~Reader()=default;virtual bool connect()=0;virtual void disconnect()=0;virtual bool connected()const=0;virtual RobotSample collect(long long sequence,bool extra,bool op,bool alarms)=0;};
+class MockReader:public Reader{
+ bool up=false;Device d;
+ public:explicit MockReader(Device device):d(std::move(device)){}bool connect()override{up=true;return true;}void disconnect()override{up=false;}bool connected()const override{return up;}
+ RobotSample collect(long long sequence,bool extra,bool op,bool alarms)override{RobotSample s;s.pos={true,0,"","mock positions"};s.torque={true,0,"","mock torque"};
+  for(int i=0;i<6;i++){s.pulses[i]=100000+i*12000+sequence*5;s.torques[i]=9+i*1.1+0.4*std::sin(double(sequence)*0.25+i);}
+  if(op){for(const auto& entry:std::array<std::pair<const char*,int>,4>{{
+     {"ControllerOnTime",223},{"ServoPowerOnTimeRobot",123},
+     {"PlayBackTimeRobot",97},{"MovingTimeRobot",81}}}){
+     OperatingReading reading;reading.type=entry.first;
+     reading.seconds=3600LL*entry.second+sequence*5;
+     reading.result={true,0,"","Elapsed Time: "+std::to_string(*reading.seconds/3600)+
+      " Hours : "+std::to_string((*reading.seconds/60)%60)+" Minutes : "+
+      std::to_string(*reading.seconds%60)+" Seconds"};
+     s.operatingReadings.push_back(std::move(reading));
+   }}
+  if(alarms){s.alarm={true,0,"","mock: no alarms"};s.activeAlarms=0;s.alarmHistory={true,0,"","mock: empty"};s.alarmHistoryJson="[]";}
+  // Read state every telemetry cycle; retain the original mock state values.
+  s.state={true,0,"","SIMULATED"};Json st;st.flag("known",true);st.flag("servo_on",false);st.flag("running",false);st.flag("alarm",false);st.flag("hold",true);st.flag("error",false);st.str("control_mode","Teach");st.str("cycle_mode","Step");st.str("source","mock");s.stateJson=st.dump();
+  if(extra){
+   s.job={true,0,"","SIMULATED"};s.jobName="MOCK_JOB";Json job;job.str("name","MOCK_JOB");job.num("line",2);job.num("step",sequence%50);job.num("speed_override_percent",50);job.str("source","mock");s.jobJson=job.dump();
+   Json info;info.flag("simulated",true);s.systemInfoJson=info.dump();
+   s.io={true,0,"","SIMULATED"};Json io;for(int a:d.io)io.num(std::to_string(a),int((sequence+a)%256));s.ioJson=io.dump();}
+  return s;}
+};
+
+#if defined(RMS_WITH_YMCONNECT) && RMS_WITH_YMCONNECT
+static std::string controlModeName(ControllerStateData::ControlMode mode){
+ switch(mode){
+  case ControllerStateData::ControlMode::Teach:return "Teach";
+  case ControllerStateData::ControlMode::Play:return "Play";
+  case ControllerStateData::ControlMode::Remote:return "Remote";
+ }
+ return "Unknown";
+}
+static std::string cycleModeName(CycleMode mode){
+ switch(mode){
+  case CycleMode::Step:return "Step";
+  case CycleMode::Cycle:return "Cycle";
+  case CycleMode::Automatic:return "Automatic";
+ }
+ return "Unknown";
+}
+static std::string alarmObjectJson(const AlarmData& alarm){
+ Json j;j.str("alarm_code",std::to_string(alarm.code));j.str("subcode",std::to_string(alarm.subcode));
+ j.str("alarm_name",alarm.name);j.str("controller_time_raw",alarm.time);return j.dump();
+}
+template<typename AlarmContainer>
+static std::string alarmArrayJson(const AlarmContainer& alarms,size_t requested){
+ const size_t count=std::min(requested,alarms.size());std::ostringstream out;out<<'[';
+ for(size_t i=0;i<count;i++){if(i)out<<',';out<<alarmObjectJson(alarms[i]);}
+ out<<']';return out.str();
+}
+static std::string activeAlarmText(const ActiveAlarms& alarms){
+ const size_t count=alarms.numberOfActiveAlarms;if(count==0)return "No active alarms.";
+ std::ostringstream out;out<<count<<(count==1?" alarm active.":" alarms active.");
+ const size_t details=std::min(count,alarms.alarms.size());
+ for(size_t i=0;i<details;i++){const auto& a=alarms.alarms[i];
+  out<<"\nAlarm "<<(i+1)<<": Code: "<<a.code<<"\nSubcode: "<<a.subcode<<"\nName: "<<a.name<<"\nTime: "<<a.time;}
+ return out.str();
+}
+static std::string operatingTimeText(const TimeData& time){
+ std::ostringstream out;out<<"Elapsed Time: "<<time.elapsedTime.Hours<<" Hours : "
+  <<time.elapsedTime.Minutes<<" Minutes : "<<time.elapsedTime.Seconds<<" Seconds";return out.str();
+}
+static std::string controllerStateJson(const ControllerStateData& state){
+ Json j;j.flag("known",true);j.flag("running",state.isRunning);j.flag("servo_on",state.isServoOn);
+ j.flag("alarm",state.isAlarming);j.flag("hold",state.isInHold);j.flag("error",state.isErroring);
+ j.str("control_mode",controlModeName(state.controlMode));j.str("cycle_mode",cycleModeName(state.cycleMode));return j.dump();
+}
+static std::string jobDataJson(const JobData& job){
+ Json j;j.str("name",job.name);j.num("line",static_cast<long long>(job.line));
+ j.num("step",static_cast<long long>(job.stepNumber));j.num("speed_override_percent",static_cast<double>(job.speedOverride));
+ j.str("task","Master");return j.dump();
+}
+static std::string systemInfoPart(const StatusInfo& status,const SystemInfoData& info){
+ Json j;const bool ok=status.StatusCode==0;j.flag("read_ok",ok);j.num("status_code",static_cast<int>(status.StatusCode));
+ if(ok){j.str("model_name",info.modelName);j.str("software_version",info.softwareVersion);}
+ else {j.null("model_name");j.null("software_version");}
+ return j.dump();
+}
+static std::string alarmCategoryName(AlarmCategory category){
+ switch(category){
+  case AlarmCategory::Major:return "Major";case AlarmCategory::Minor:return "Minor";
+  case AlarmCategory::UserSystem:return "UserSystem";case AlarmCategory::User:return "User";
+  case AlarmCategory::Offline:return "Offline";
+ }
+ return "Unknown";
+}
+static constexpr UINT32 ALARM_HISTORY_PER_CATEGORY=20;
+static std::string readAlarmHistory(FaultInterface* faults,Reading& result){
+ const std::array<AlarmCategory,5> categories{{AlarmCategory::Major,AlarmCategory::Minor,
+  AlarmCategory::UserSystem,AlarmCategory::User,AlarmCategory::Offline}};
+ std::ostringstream entries;entries<<'[';bool first=true,allOk=true,anyOk=false;
+ for(const auto category:categories){
+  AlarmHistory history{};const auto status=faults->GetAlarmHistory(category,ALARM_HISTORY_PER_CATEGORY,history);
+  const bool ok=status.StatusCode==0;allOk=allOk&&ok;anyOk=anyOk||ok;
+  if(!first)entries<<',';
+  first=false;
+  Json item;item.str("category",alarmCategoryName(category));item.flag("read_ok",ok);
+  item.num("status_code",static_cast<int>(status.StatusCode));item.num("requested_count",static_cast<int>(ALARM_HISTORY_PER_CATEGORY));
+  if(ok){const size_t count=std::min<size_t>(history.numberOfAlarmsFetched,history.alarm.size());
+   item.num("fetched_count",static_cast<int>(count));item.raw("alarms",alarmArrayJson(history.alarm,count));
+  }else{item.null("fetched_count");item.raw("alarms","[]");}
+  entries<<item.dump();
+ }
+ entries<<']';Json payload;payload.num("requested_per_category",static_cast<int>(ALARM_HISTORY_PER_CATEGORY));
+ payload.raw("categories",entries.str());
+ result={allOk,allOk?0:-1,allOk?"":(anyOk?"Some alarm history categories failed":"All alarm history category reads failed"),payload.dump()};
+ return payload.dump();
+}
+#endif
+#if defined(RMS_WITH_YMCONNECT) && RMS_WITH_YMCONNECT
+// Real SDK known-compatible core. Additional reads are kept isolated below.
+class YmReader:public Reader{
+ Device d;MotomanController* controller=nullptr;
+ public:explicit YmReader(Device dev):d(std::move(dev)){}~YmReader(){disconnect();}
+ bool connected()const override{return controller!=nullptr;}
+ bool connect()override{disconnect();StatusInfo st{};controller=YMConnect::OpenConnection(d.ip.c_str(),st);if(!controller||st.StatusCode!=0){log("[YMConnect "+d.ip+"] OPEN FAILED code="+std::to_string(st.StatusCode));disconnect();return false;}log("[YMConnect] Connected "+d.ip);return true;}
+ void disconnect()override{if(controller){YMConnect::CloseConnection(controller);controller=nullptr;}}
+ RobotSample collect(long long,bool extra,bool op,bool alarms)override{
+  if(!controller)throw std::runtime_error("Not connected to YRC1000");
+  RobotSample out;
+  PositionData p{};auto ps=controller->ControlGroup->ReadPositionData(ControlGroupId::R1,CoordinateType::Pulse,0,0,p);
+  out.pos={ps.StatusCode==0,int(ps.StatusCode),ps.StatusCode==0?"":"YMConnect position read failed",""};
+  if(out.pos.ok)for(int i=0;i<6;i++)out.pulses[i]=static_cast<double>(p.axisData[i]);
+  TorqueData t{};auto ts=controller->ControlGroup->ReadTorqueData(ControlGroupId::R1,t);
+  out.torque={ts.StatusCode==0,int(ts.StatusCode),ts.StatusCode==0?"":"YMConnect torque read failed",""};
+  if(out.torque.ok)for(int i=0;i<6;i++)out.torques[i]=static_cast<double>(t.axisData[i]);
+  if(op){
+   const std::array<std::pair<const char*,TimeType>,4> counters{{
+    {"ControllerOnTime",TimeType::ControllerOnTime},
+    {"ServoPowerOnTimeRobot",TimeType::ServoPowerOnTimeRobot},
+    {"PlayBackTimeRobot",TimeType::PlayBackTimeRobot},
+    {"MovingTimeRobot",TimeType::MovingTimeRobot}}};
+   for(const auto& [name,type]:counters){
+    TimeData td{};const auto res=controller->Status->ReadOperatingTimes(ControlGroupId::R1,type,td);
+    const bool ok=res.StatusCode==0;
+    OperatingReading reading;reading.type=name;
+    reading.result={ok,static_cast<int>(res.StatusCode),ok?"":"Operating time read failed",ok?operatingTimeText(td):""};
+    if(ok){
+     if(td.elapsedTime.Minutes<60&&td.elapsedTime.Seconds<60){
+      reading.seconds=static_cast<int64_t>(uint64_t(td.elapsedTime.Hours)*3600ULL+
+       uint64_t(td.elapsedTime.Minutes)*60ULL+uint64_t(td.elapsedTime.Seconds));
+     }else {reading.result.ok=false;reading.result.error="YMConnect elapsed time components are out of range";reading.result.raw.clear();}
+    }
+    out.operatingReadings.push_back(std::move(reading));
+   }
+  }
+  if(alarms){
+   ActiveAlarms a{};auto res=controller->Faults->GetActiveAlarms(a);
+   const bool ok=res.StatusCode==0;
+   out.alarm={ok,static_cast<int>(res.StatusCode),ok?"":"Active alarm read failed",ok?activeAlarmText(a):""};
+   if(ok){out.activeAlarms=static_cast<int>(a.numberOfActiveAlarms);
+    const size_t count=std::min<size_t>(a.numberOfActiveAlarms,a.alarms.size());
+    out.activeAlarmsJson=alarmArrayJson(a.alarms,count);}
+   out.alarmHistoryJson=readAlarmHistory(controller->Faults,out.alarmHistory);
+  }
+  // Servo/controller state follows telemetry, independent of the slower extras interval.
+  // This is a read only; it never changes servo power or commands motion.
+  ControllerStateData stateData{};auto stateStatus=controller->Status->ReadState(stateData);
+  const bool stateOk=stateStatus.StatusCode==0;
+  out.state={stateOk,static_cast<int>(stateStatus.StatusCode),stateOk?"":"YMConnect state read failed",stateOk?controllerStateJson(stateData):""};
+  if(stateOk)out.stateJson=controllerStateJson(stateData);
+  if(extra){
+   SystemInfoData robotInfo{},stationInfo{},applicationInfo{};
+   const auto robotStatus=controller->Status->ReadSystemInformation(SystemInfoId::R1,robotInfo);
+   const auto stationStatus=controller->Status->ReadSystemInformation(SystemInfoId::S1,stationInfo);
+   const auto applicationStatus=controller->Status->ReadSystemInformation(SystemInfoId::A1,applicationInfo);
+   Json info;info.raw("robot_r1",systemInfoPart(robotStatus,robotInfo));
+   info.raw("station_s1",systemInfoPart(stationStatus,stationInfo));
+   info.raw("application_a1",systemInfoPart(applicationStatus,applicationInfo));
+   out.systemInfoJson=info.dump();
+   JobData jobData{};auto jobStatus=controller->Job->GetExecutingJobInformation(InformTaskNumber::Master,jobData);
+   const bool jobOk=jobStatus.StatusCode==0;
+   out.job={jobOk,static_cast<int>(jobStatus.StatusCode),jobOk?"":"YMConnect job read failed",jobOk?jobData.name:""};
+   if(jobOk){out.jobName=jobData.name;out.jobJson=jobDataJson(jobData);}
+   Json ioValues;bool allIORead=true;
+   if(d.io.empty()){out.io={false,-1,"No IO addresses configured", ""};}
+   else {
+    for(int address:d.io){
+     IOByteData value{};
+     auto status=controller->Io->ReadByte(address,value);
+     Json cell;bool ok=status.StatusCode==0;cell.flag("read_ok",ok);
+     cell.num("status_code",int(status.StatusCode));
+     if(ok)cell.str("sdk_raw_text",streamIfPossible(value));else {cell.null("sdk_raw_text");allIORead=false;}
+     ioValues.raw(std::to_string(address),cell.dump());
+    }
+    out.io={allIORead,allIORead?0:-1,allIORead?"":"Some IO address reads failed",ioValues.dump()};
+    out.ioJson=ioValues.dump();
+   }
+  }
+  return out;
+ }
+};
+#endif
+static std::string availability(const Reading&r){Json j;j.flag("read_ok",r.ok);j.num("status_code",r.code);j.str("message",r.error);if(r.ok)j.str("raw",r.raw);else j.null("raw");return j.dump();}
+static std::string metadata(const RobotSample&s,bool mock,const Device&d){Json j;j.flag("simulated",mock);j.str("torque_unit","sdk_raw");j.str("position_unit","pulses");j.str("group",d.group);j.raw("controller_state",s.stateJson);j.raw("job",s.jobJson);j.raw("system_info",s.systemInfoJson);j.raw("io_values",s.ioJson);j.raw("alarm_history",s.alarmHistoryJson);j.raw("state_read",availability(s.state));j.raw("job_read",availability(s.job));j.raw("io_read",availability(s.io));j.raw("alarm_history_read",availability(s.alarmHistory));return j.dump();}
+static std::string telemetryJson(const Device&d,const std::string&session,long long seq,const std::string&at,const RobotSample&s,bool mock){Json j;j.num("robot_id",d.id);j.str("collector_session_id",session);j.num("sequence",seq);j.str("sampled_at",at);j.flag("position_ok",s.pos.ok);j.num("position_status_code",s.pos.code);j.str("position_status_message",s.pos.error);if(s.pos.ok){j.str("position_sampled_at",at);j.raw("position_pulses",axesJson(s.pulses));}else{j.null("position_sampled_at");j.null("position_pulses");}j.flag("torque_ok",s.torque.ok);j.num("torque_status_code",s.torque.code);j.str("torque_status_message",s.torque.error);if(s.torque.ok){j.str("torque_sampled_at",at);j.raw("torque_axes",axesJson(s.torques));}else{j.null("torque_sampled_at");j.null("torque_axes");}j.str("torque_unit","sdk_raw");j.raw("raw_payload",metadata(s,mock,d));return j.dump();}
+static std::string opJson(const Device&d,const std::string&at,const OperatingReading&s,bool mock){Json j;j.num("robot_id",d.id);j.str("time_type",s.type);j.str("sampled_at",at);j.flag("read_ok",s.result.ok);j.num("status_code",s.result.code);j.str("status_message",s.result.error);if(s.result.ok)j.str("value_raw",s.result.raw);else j.null("value_raw");if(s.result.ok&&s.seconds)j.num("value_seconds",static_cast<long long>(*s.seconds));else j.null("value_seconds");Json raw;raw.flag("simulated",mock);raw.str("duration_unit","seconds");raw.str("duration_source","YMConnect TimeData.elapsedTime Hours/Minutes/Seconds");j.raw("raw_payload",raw.dump());return j.dump();}
+static std::string alarmJson(const Device&d,const std::string&at,const RobotSample&s,bool mock){Json j;j.num("robot_id",d.id);j.str("sampled_at",at);j.flag("read_ok",s.alarm.ok);j.num("status_code",s.alarm.code);j.str("status_message",s.alarm.error);if(s.alarm.ok)j.str("sdk_text",s.alarm.raw);else j.null("sdk_text");if(s.alarm.ok&&s.activeAlarms)j.num("active_alarm_count",*s.activeAlarms);else j.null("active_alarm_count");j.raw("parsed_alarms",s.alarm.ok?s.activeAlarmsJson:"null");Json raw;raw.flag("simulated",mock);raw.raw("active_alarms",s.alarm.ok?s.activeAlarmsJson:"null");raw.raw("alarm_history",s.alarmHistoryJson);raw.raw("alarm_history_read",availability(s.alarmHistory));j.raw("raw_payload",raw.dump());return j.dump();}
+static std::string connectionJson(const Device&d,const std::string&at,const std::string&state,bool mock){Json j;j.num("robot_id",d.id);j.str("state",state);j.str("occurred_at",at);j.str("ip_address",d.ip);j.str("message",mock?"MOCK TEST — NOT ACTUAL ROBOT":"YMConnect collector status");Json r;r.flag("simulated",mock);r.str("control_group",d.group);j.raw("raw_payload",r.dump());return j.dump();}
+static void waitUntil(Clock::time_point target){while(running&&Clock::now()<target)std::this_thread::sleep_for(std::min(std::chrono::milliseconds(150),std::chrono::duration_cast<std::chrono::milliseconds>(target-Clock::now())));}
+static void loopOne(Config cfg,Device dev,bool mock,bool dry,bool once,const std::string&token){
+ Dispatcher tx(cfg,dev,dry,token);std::unique_ptr<Reader>reader;
+ if(mock)reader=std::make_unique<MockReader>(dev);
+ else{
+#if defined(RMS_WITH_YMCONNECT) && RMS_WITH_YMCONNECT
+ reader=std::make_unique<YmReader>(dev);
+#else
+ throw std::runtime_error("Real collector needs -DRMS_ENABLE_YMCONNECT=ON and matching SDK");
+#endif
+ }
+ constexpr int MAX_CONSECUTIVE_BAD_SAMPLES=3;
+ std::string session=uuid();long long sequence=0;bool announced=false;int badSamples=0;
+ auto nextOp=Clock::now(),nextAlarm=nextOp,nextExtra=nextOp;
+ log("[RMS] robot_id="+std::to_string(dev.id)+" ip="+dev.ip+(mock?" MOCK":" REAL")+" started");
+ while(running){
+  auto start=Clock::now();
+  if(!reader->connected()&&!reader->connect()){
+   if(once)throw std::runtime_error("YMConnect could not connect to robot "+std::to_string(dev.id)+" at "+dev.ip);
+   if(announced){tx.post("/api/v1/collector/connections",connectionJson(dev,timestamp(),"offline",mock));announced=false;}
+   tx.flush();waitUntil(start+std::chrono::milliseconds(cfg.telemetryMs));continue;
+  }
+  auto now=Clock::now();bool doOp=now>=nextOp,doAlarm=now>=nextAlarm,doExtras=now>=nextExtra;
+  RobotSample r=reader->collect(sequence,doExtras,doOp,doAlarm);
+  const bool good=r.pos.ok||r.torque.ok;const std::string at=timestamp();
+  if(good){badSamples=0;if(!announced){tx.post("/api/v1/collector/connections",connectionJson(dev,at,"connected",mock));announced=true;}}
+  else{
+   ++badSamples;
+   if(badSamples>=MAX_CONSECUTIVE_BAD_SAMPLES){
+    if(announced)tx.post("/api/v1/collector/connections",connectionJson(dev,at,"offline",mock));
+    announced=false;reader->disconnect();badSamples=0;
+    log("[YMConnect "+std::to_string(dev.id)+"] disconnected after "+std::to_string(MAX_CONSECUTIVE_BAD_SAMPLES)+" consecutive cycles with no position or torque data");
+   }
+  }
+  if(once&&!good)throw std::runtime_error("No position or torque read succeeded for robot "+std::to_string(dev.id));
+  if(good)tx.post("/api/v1/collector/telemetry",telemetryJson(dev,session,sequence,at,r,mock));
+  if(doOp){for(const auto& counter:r.operatingReadings)tx.post("/api/v1/collector/operating-times",opJson(dev,timestamp(),counter,mock));nextOp=now+std::chrono::seconds(cfg.operatingS);}
+  if(doAlarm){tx.post("/api/v1/collector/alarms/snapshots",alarmJson(dev,timestamp(),r,mock));nextAlarm=now+std::chrono::seconds(cfg.alarmS);}
+  if(doExtras){nextExtra=now+std::chrono::seconds(cfg.extrasS);if(!r.state.ok||!r.job.ok||!r.io.ok)log("[SDK "+std::to_string(dev.id)+"] extras: "+r.state.error+"; "+r.job.error+"; "+r.io.error);}
+  tx.flush();if(once)break;++sequence;waitUntil(start+std::chrono::milliseconds(cfg.telemetryMs));
+ }
+ if(announced&&!once)tx.post("/api/v1/collector/connections",connectionJson(dev,timestamp(),"stopped",mock));
+ reader->disconnect();
+}
+int main(int argc,char**argv){
+ try{std::string path="config/collector.conf";bool mock=false,real=false,once=false,dry=false,probe=false,allowMockPost=false;int selected=0;
+ for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--config"&&i+1<argc)path=argv[++i];else if(a=="--robot-id"&&i+1<argc)selected=integer("robot-id",argv[++i],1,1000000);else if(a=="--mock")mock=true;else if(a=="--real")real=true;else if(a=="--once")once=true;else if(a=="--dry-run")dry=true;else if(a=="--probe")probe=true;else if(a=="--allow-mock-post")allowMockPost=true;else if(a=="--help"){std::cout<<"rms_collector --config config/collector.conf --mock|--real [--once] [--dry-run] [--robot-id N] [--probe] [--allow-mock-post]\n";return 0;}else throw std::runtime_error("Unknown argument "+a);}
+ if(mock&&real)throw std::runtime_error("Cannot use --mock and --real together");
+ if(mock&&!dry&&!allowMockPost)throw std::runtime_error("MOCK POST blocked. Use --dry-run or explicitly --allow-mock-post with a DEMO robot ID only");
+ if(!mock&&!real&&!probe)throw std::runtime_error("Choose --mock, --real, or --probe");
+ Config cfg=configFrom(path);
+ std::signal(SIGINT,onSignal);std::signal(SIGTERM,onSignal);
+#if !defined(_WIN32)
+ umask(0077);
+#endif
+ if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK)throw std::runtime_error("libcurl startup failed");
+ struct C{~C(){curl_global_cleanup();}} clean;
+ std::string token=dry||probe?"":readToken(cfg.token);
+ if(probe){Http h(cfg,"");auto r=h.run("/up",{},false);log("[PROBE] GET "+cfg.base+"/up -> "+r.summary());return r.error==CURLE_OK&&r.status>=200&&r.status<400?0:1;}
+ std::vector<std::thread>pool;std::vector<std::exception_ptr>errors;std::mutex errorsMutex;
+ for(auto dev:cfg.devices){if(selected&&dev.id!=selected)continue;pool.emplace_back([&,dev]{try{loopOne(cfg,dev,mock,dry,once,token);}catch(...){std::lock_guard<std::mutex>l(errorsMutex);errors.push_back(std::current_exception());running=false;}});}
+ if(pool.empty())throw std::runtime_error("Selected robot_id not in config");
+ for(auto&t:pool)t.join();
+ if(!errors.empty())std::rethrow_exception(errors.front());
+ log("[RMS] Done");return 0;
+ }catch(const std::exception&e){std::cerr<<"[ERROR] "<<e.what()<<'\n';return 1;}
+}
